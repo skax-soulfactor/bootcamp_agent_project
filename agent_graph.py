@@ -11,6 +11,11 @@ from langgraph.graph import StateGraph, START, END, MessagesState
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.memory import MemorySaver
 
+from pydantic import BaseModel, Field
+from langchain_core.messages import HumanMessage
+from langchain_core.prompts import ChatPromptTemplate
+
+
 # 환경 변수 로드
 load_dotenv()
 
@@ -62,38 +67,97 @@ llm_with_tools = llm.bind_tools(tools)
 # ==========================================
 # 3. 노드(Node) 정의
 # ==========================================
-# 시스템 프롬프트: 에이전트의 역할과 도구 사용 규칙을 강력하게 정의합니다.
+# (1) Agent 노드 (코드 생성기)
 sys_msg = SystemMessage(content="""당신은 10년 차 사내 백엔드 자바 아키텍트입니다.
 사용자가 코드를 요청하면, 먼저 'search_inhouse_framework' 도구를 사용하여 사내 코드를 검색하세요.
 반드시 도구로 검색된 [사내 프레임워크 Context]만을 참고하여 질문에 답하고 코드를 작성해야 합니다.
-없는 외부 라이브러리를 지어내지 말고, 참조한 클래스나 어노테이션에 대해 주석으로 친절히 설명해 주세요.
-일상적인 대화(안녕, 날씨 등)에는 도구를 쓰지 말고 가볍게 대답하세요.""")
+없는 외부 라이브러리(예: Spring의 @RestController 등)를 마음대로 지어내지 마세요.
+리뷰어(Reviewer)의 피드백이 있다면, 피드백을 반영하여 코드를 다시 작성하세요.""")
 
 def agent_node(state: MessagesState):
-    print("\n--- [Agent Node] LLM 생각 중... ---")
-    # 대화 기록(messages)의 맨 앞에 시스템 프롬프트를 삽입하여 LLM에 전달
+    print("\n--- [Agent Node] 코드 작성 및 도구 사용 판단 중... ---")
     messages = [sys_msg] + state["messages"]
     response = llm_with_tools.invoke(messages)
-    return {"messages": [response]} # 상태(State)의 messages 배열에 AI의 답변(또는 도구 호출 요청)을 추가
+    return {"messages": [response]} 
+
+# (2) 🚀 Reviewer 노드 (코드 검증기 - 핵심 가산점 포인트)
+class ReviewResult(BaseModel):
+    is_valid: bool = Field(description="코드가 사내 규칙을 모두 준수했는지 여부")
+    feedback: str = Field(description="위반 사항이 있다면 구체적인 수정 요청 피드백. 통과면 'PASS'")
+
+def reviewer_node(state: MessagesState):
+    print("\n--- [Reviewer Node] 사내 코딩 컨벤션 및 규칙 검증 중... ---")
+    last_msg = state["messages"][-1].content
+    
+    # 코드가 포함되지 않은 단순 일상 대화는 검증 없이 통과
+    if "class" not in last_msg and "public" not in last_msg:
+        print("✅ [Reviewer] 일반 대화로 감지되어 검증을 패스합니다.")
+        return {"messages": []} 
+        
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """당신은 깐깐한 사내 코드 리뷰어입니다. 
+        작성된 코드가 다음 사내 규칙을 준수했는지 엄격하게 평가하세요:
+        1. 사내 DB 처리를 위해 CompanyDbTemplate을 사용했는가? (직접 Connection이나 Spring JdbcTemplate 사용 금지)
+        2. 권한 처리를 위해 CompanySecurityContext 또는 @CompanyAuth를 사용했는가?
+        3. 외부 프레임워크(Spring Boot 등)의 어노테이션을 무단으로 추가하지 않았는가?
+        
+        단 하나라도 위반했다면 is_valid=False로 하고 어떻게 고쳐야 할지 feedback을 작성하세요.
+        완벽하게 준수했다면 is_valid=True로 하세요."""),
+        ("user", "{code}")
+    ])
+    
+    # Structured Output으로 엄격한 검증 결과 추출
+    reviewer_llm = llm.with_structured_output(ReviewResult)
+    result = (prompt | reviewer_llm).invoke({"code": last_msg})
+    
+    if result.is_valid:
+        print("✅ [Reviewer] 검증 통과! 완벽한 사내 코드입니다. 사용자에게 전달합니다.")
+        return {"messages": []} # 변경 없이 그대로 종료로 넘김
+    else:
+        print(f"❌ [Reviewer] 사내 규칙 위반 발견! 피드백: {result.feedback}")
+        # 피드백을 HumanMessage로 감싸서 다시 Agent에게 던짐
+        feedback_msg = HumanMessage(
+            content=f"[코드 리뷰어 피드백 - 이 피드백을 반영해서 코드를 다시 작성하세요]\n{result.feedback}", 
+            name="Reviewer"
+        )
+        return {"messages": [feedback_msg]}
 
 # ==========================================
-# 4. 그래프(Graph) 구성 및 메모리 연결
+# 4. 그래프(Graph) 엣지 흐름 제어 (Custom Routing)
 # ==========================================
+# (1) Agent 실행 후 어디로 갈지 결정
+def route_after_agent(state: MessagesState):
+    last_message = state["messages"][-1]
+    # 도구를 호출했다면 Tool 노드로 이동
+    if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
+        return "tools"
+    # 도구 호출이 없고 코드를 생성했다면 무조건 Reviewer 노드로 이동하여 검사받음
+    return "reviewer"
+
+# (2) Reviewer 실행 후 어디로 갈지 결정
+def route_after_reviewer(state: MessagesState):
+    last_message = state["messages"][-1]
+    # 방금 추가된 메시지가 리뷰어의 '피드백'이라면, 다시 Agent로 돌아가서 코드 수정 (Loop)
+    if last_message.name == "Reviewer":
+        return "agent"
+    # 피드백이 추가되지 않았다면(검증 통과), 대화 종료
+    return END
+
+# 그래프 구성
 workflow = StateGraph(MessagesState)
 
 # 노드 등록
 workflow.add_node("agent", agent_node)
-# LangGraph에서 제공하는 기본 ToolNode를 사용하면 도구 실행 결과를 자동으로 State에 합쳐줍니다.
 workflow.add_node("tools", ToolNode(tools))
+workflow.add_node("reviewer", reviewer_node)
 
-# 흐름(엣지) 연결
+# 흐름 연결 (복잡한 순환 루프 완성!)
 workflow.add_edge(START, "agent")
+workflow.add_conditional_edges("agent", route_after_agent)
+workflow.add_edge("tools", "agent") # 도구 검색이 끝나면 다시 에이전트로
+workflow.add_conditional_edges("reviewer", route_after_reviewer) # 리뷰 결과에 따라 재수정(agent) 또는 끝(END)
 
-# 🚀 조건부 라우팅 (LLM이 도구를 쓰겠다고 판단하면 'tools'로, 아니면 대화 종료(END)로 자동 분기)
-workflow.add_conditional_edges("agent", tools_condition)
-workflow.add_edge("tools", "agent") # 도구 실행이 끝나면 다시 에이전트에게 돌아와서 최종 답변을 만들게 함 (Loop)
-
-# 🚀 메모리 기능 추가 (심사위원 요구사항: 멀티턴 대화 기억)
+# 메모리 연동 컴파일
 memory = MemorySaver()
 app = workflow.compile(checkpointer=memory)
 
