@@ -1,6 +1,6 @@
 import streamlit as st
 import uuid
-# 우리가 만든 LangGraph 에이전트를 불러옵니다.
+# 우리가 만든 LangGraph 에이전트와 DB 빌드 함수를 불러옵니다.
 from agent_graph import app as agent_app 
 from config import build_vector_db
 
@@ -11,7 +11,7 @@ st.title("🛠️ DevX-Copilot")
 st.caption("사내 Java 프레임워크 특화 자율형 AI 에이전트")
 
 # ==========================================
-# 🚀 [신규 기능] 사이드바 관리자 메뉴 (DB 업데이트)
+# ⚙️ 사이드바 관리자 메뉴 (DB 업데이트)
 # ==========================================
 with st.sidebar:
     st.header("⚙️ 관리자 설정")
@@ -20,16 +20,14 @@ with st.sidebar:
     if st.button("🔄 Vector DB 초기화 및 생성", use_container_width=True):
         with st.spinner("사내 소스 코드를 읽어 DB를 구축하고 있습니다..."):
             try:
-                # config.py에 만들어둔 함수 호출!
                 chunk_count = build_vector_db()
                 st.success(f"✅ DB 구축 완료! (총 {chunk_count}개의 코드 조각 저장)")
             except Exception as e:
                 st.error(f"🚨 DB 구축 실패: {str(e)}")
 
 # ==========================================
-# 🚀 1. 세션 상태 및 Thread ID 초기화
+# 1. 세션 상태 및 Thread ID 초기화
 # ==========================================
-# 사용자마다 고유한 대화 기록(Memory)을 유지하기 위해 고유 ID 생성
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
 
@@ -44,40 +42,39 @@ for msg in st.session_state.messages:
         st.markdown(msg["content"])
 
 # ==========================================
-# 🚀 2. 채팅 입력 및 에이전트 실행 (예외 처리 추가)
+# 🚀 2. 채팅 입력 및 에이전트 실행 (무결점 에러 핸들링)
 # ==========================================
-if prompt := st.chat_input("예: 결제 내역 페이징해서 가져오는 로직 짜줘"):
+if prompt := st.chat_input("예: 사용자 목록 페이징 로직 짜줘"):
     
-    # 🎯 개선점: 사용자 입력 검증 (빈 문자열 차단)
+    # 1) 입력 검증: 빈 텍스트 차단
     if not prompt.strip():
         st.warning("⚠️ 질문을 입력해 주세요.")
         st.stop()
 
-    # 사용자가 입력한 메시지를 화면에 출력 및 저장
+    # 2) 사용자 메시지 화면 출력 및 세션 저장
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # 에이전트 실행 및 답변 출력
+    # 3) AI 응답 처리
     with st.chat_message("assistant"):
-        with st.spinner("에이전트가 생각하고 검증하는 중입니다... (Tool 검색 & 코드 리뷰 진행)"):
+        with st.spinner("에이전트들이 협업하여 사내 코드를 작성 중입니다..."):
             try:
+                # 에이전트 호출
                 config = {"configurable": {"thread_id": st.session_state.thread_id}}
-                
-                # 🎯 개선점: LLM 및 그래프 실행 중 발생할 수 있는 오류를 try-except로 방어
                 result = agent_app.invoke({"messages": [("user", prompt)]}, config=config)
                 
+                # 에러 없이 정상적으로 결과가 나왔을 때만 변수 할당
                 answer = result["messages"][-1].content
                 st.markdown(answer)
                 
-                # AI의 답변을 채팅 기록에 저장
+                # 정상 답변만 세션에 깔끔하게 추가
                 st.session_state.messages.append({"role": "assistant", "content": answer})
                 
             except Exception as e:
-                # 🎯 개선점: 오류 발생 시 앱이 죽지 않고 사용자에게 친절하게 안내
-                error_msg = f"🚨 시스템 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.\n\n(상세 에러: {str(e)})"
+                # 🎯 해결 포인트: 에러 발생 시 answer 변수 의존성을 완벽히 제거!
+                error_msg = f"🚨 시스템 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.\n\n(상세 에러: `{str(e)}`)"
                 st.error(error_msg)
+                
+                # 에러 메시지를 세션에 저장하여, 새로고침해도 에러 상황의 문맥이 유지되도록 함
                 st.session_state.messages.append({"role": "assistant", "content": error_msg})
-            
-    # AI의 답변을 채팅 기록에 저장
-    st.session_state.messages.append({"role": "assistant", "content": answer})
