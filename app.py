@@ -2,12 +2,29 @@ import streamlit as st
 import uuid
 # 우리가 만든 LangGraph 에이전트를 불러옵니다.
 from agent_graph import app as agent_app 
+from config import build_vector_db
 
 # 페이지 기본 설정
 st.set_page_config(page_title="DevX-Copilot", page_icon="🤖", layout="centered")
 
 st.title("🛠️ DevX-Copilot")
 st.caption("사내 Java 프레임워크 특화 자율형 AI 에이전트")
+
+# ==========================================
+# 🚀 [신규 기능] 사이드바 관리자 메뉴 (DB 업데이트)
+# ==========================================
+with st.sidebar:
+    st.header("⚙️ 관리자 설정")
+    st.info("사내 코드가 변경되었거나 처음 실행하는 경우 아래 버튼을 눌러 DB를 최신화하세요.")
+    
+    if st.button("🔄 Vector DB 초기화 및 생성", use_container_width=True):
+        with st.spinner("사내 소스 코드를 읽어 DB를 구축하고 있습니다..."):
+            try:
+                # config.py에 만들어둔 함수 호출!
+                chunk_count = build_vector_db()
+                st.success(f"✅ DB 구축 완료! (총 {chunk_count}개의 코드 조각 저장)")
+            except Exception as e:
+                st.error(f"🚨 DB 구축 실패: {str(e)}")
 
 # ==========================================
 # 🚀 1. 세션 상태 및 Thread ID 초기화
