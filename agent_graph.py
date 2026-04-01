@@ -3,7 +3,7 @@ from typing_extensions import TypedDict
 from pydantic import BaseModel, Field
 
 from langchain_core.tools import tool
-from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage
+from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage, AIMessage
 from langchain_core.prompts import ChatPromptTemplate
 
 from langgraph.graph.message import add_messages
@@ -21,6 +21,7 @@ from prompts import ROUTER_PROMPT, QA_PROMPT, RETRIEVER_PROMPT, GENERATOR_PROMPT
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     intent: str
+    context_sufficient: bool  # 🚀 신규: Generator가 컨텍스트 충분 여부를 스스로 판단해 저장
 
 @tool
 def search_inhouse_framework(query: str) -> str:
@@ -49,13 +50,21 @@ def router_node(state: AgentState):
     ]) | llm.with_structured_output(RouteOutput)).invoke({"question": last_msg})
     return {"intent": result.intent}
 
+class QADecision(BaseModel):
+    topic: Literal["greeting", "emotion", "general_knowledge", "out_of_bounds"] = Field(description="질문의 주제를 스스로 판단하여 분류")
+    response: str = Field(description="판단된 주제에 맞는 맞춤형 답변")
+
 def general_qa_node(state: AgentState):
-    print("\n--- [Node 2: General QA Agent] 일반 대화 처리 중 ---")
+    print("\n--- [Node 2: General QA Agent] 질문 의도 심층 분석 및 답변 판단 중 ---")
     last_msg = state["messages"][-1].content
-    response = (ChatPromptTemplate.from_messages([
+    
+    # 스스로 주제를 분류(의사결정)한 후 답변을 생성합니다.
+    result = (ChatPromptTemplate.from_messages([
         ("system", QA_PROMPT), ("user", "{question}")
-    ]) | llm).invoke({"question": last_msg})
-    return {"messages": [response]}
+    ]) | llm.with_structured_output(QADecision)).invoke({"question": last_msg})
+    
+    print(f"💡 [QA Agent 의사결정]: 이 질문은 '{result.topic}' 카테고리로 분류되었습니다. 이에 맞춰 대답합니다.")
+    return {"messages": [AIMessage(content=result.response)]}
 
 # 🚀 신규: 검색 및 도구 호출을 전담하는 Retriever Agent
 def retriever_agent_node(state: AgentState):
@@ -64,12 +73,28 @@ def retriever_agent_node(state: AgentState):
     response = llm_with_tools.invoke(messages)
     return {"messages": [response]} 
 
-# 🚀 수정됨: 코드를 짜기만 하는 Generator Agent (도구 없이 프롬프트로만 작업)
+class GeneratorDecision(BaseModel):
+    analysis: str = Field(description="Retriever가 찾아온 컨텍스트가 코드를 작성하기에 충분한지 단계별로 평가")
+    is_enough: bool = Field(description="충분하면 True, 정보가 부족해 재검색이 필요하면 False")
+    code_or_feedback: str = Field(description="True일 경우 완성된 코드. False일 경우 Retriever에게 지시할 구체적인 추가 검색 요청 메시지")
+
 def generator_agent_node(state: AgentState):
-    print("\n--- [Node 4: Generator Agent] 사내 표준 코드 생성 중 ---")
+    print("\n--- [Node 4: Generator Agent] 검색 데이터 평가 및 코드 생성 판단 중 ---")
     messages = [SystemMessage(content=GENERATOR_PROMPT)] + state["messages"]
-    response = llm.invoke(messages) # Tool 바인딩 없는 순수 LLM 사용
-    return {"messages": [response]} 
+    
+    # 단순 생성이 아니라, 제공받은 정보를 스스로 평가(의사결정)합니다.
+    result = llm.with_structured_output(GeneratorDecision).invoke(messages)
+    
+    if result.is_enough:
+        print("💡 [Generator 의사결정]: 컨텍스트가 충분합니다. 코드를 생성합니다.")
+    else:
+        print("⚠️ [Generator 의사결정]: 정보가 부족합니다! Retriever에게 추가 검색을 지시합니다.")
+        
+    return {
+        # name="Generator"를 달아서 이 메시지가 Generator의 추가 지시임을 명시합니다.
+        "messages": [AIMessage(content=result.code_or_feedback, name="Generator")],
+        "context_sufficient": result.is_enough
+    }
 
 class ReviewResult(BaseModel):
     is_valid: bool
@@ -104,6 +129,12 @@ def route_after_reviewer(state: AgentState):
     # 반려 시 Generator가 다시 코드를 짜도록 루프!
     return "generator" if state["messages"][-1].name == "Reviewer" else END
 
+def route_after_generator(state: AgentState):
+    # Generator가 스스로 판단해서 정보가 부족하다고 하면, Reviewer로 가지 않고 Retriever로 반송시킵니다!
+    if not state.get("context_sufficient", True):
+        return "retriever"
+    return "reviewer"
+
 workflow = StateGraph(AgentState)
 
 # 노드 등록 (총 6개: 5개의 에이전트 + 1개의 ToolNode)
@@ -122,7 +153,7 @@ workflow.add_edge("general_qa", END)
 workflow.add_conditional_edges("retriever", route_after_retriever)
 workflow.add_edge("search_tools", "retriever") # 검색 끝내고 다시 Retriever에게 요약 지시
 
-workflow.add_edge("generator", "reviewer")
+workflow.add_conditional_edges("generator", route_after_generator)
 workflow.add_conditional_edges("reviewer", route_after_reviewer)
 
 app = workflow.compile(checkpointer=MemorySaver())
