@@ -11,9 +11,10 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
 
-# 모듈화된 파일들에서 설정과 프롬프트를 불러옵니다.
-from config import llm, retriever
-from prompts import ROUTER_PROMPT, QA_PROMPT, RETRIEVER_PROMPT, GENERATOR_PROMPT, REVIEWER_PROMPT
+# 🚀 분리된 계층에서 모듈 불러오기
+from config.settings import llm
+from rag.advanced_retriever import advanced_retriever as retriever
+from agents.prompts import ROUTER_PROMPT, QA_PROMPT, RETRIEVER_PROMPT, GENERATOR_PROMPT, REVIEWER_PROMPT
 
 # ==========================================
 # 1. State 및 Tool 정의

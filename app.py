@@ -1,8 +1,9 @@
 import streamlit as st
 import uuid
-# 우리가 만든 LangGraph 에이전트와 DB 빌드 함수를 불러옵니다.
-from agent_graph import app as agent_app 
-from config import build_vector_db
+
+# 🚀 분리된 패키지에서 에이전트와 RAG 적재 모듈을 가져옵니다.
+from agents.graph import app as agent_app 
+from rag.ingestion import build_vector_db
 
 # 페이지 기본 설정
 st.set_page_config(page_title="DevX-Copilot", page_icon="🤖", layout="centered")
